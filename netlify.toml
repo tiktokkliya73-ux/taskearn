@@ -1,0 +1,20 @@
+# Netlify configuration — Task Earn Hub (Next.js 16, App Router)
+#
+# Framework: Next.js (detected from package.json / next.config.ts).
+# The @netlify/plugin-nextjs runtime turns the App Router pages and the
+# /api/* routes into Netlify Functions automatically — no manual function
+# setup is required.
+#
+# IMPORTANT for this app (see DEPLOYMENT.md):
+#  1. Set the environment variables listed in .env.example in the Netlify UI
+#     BEFORE the first deploy.
+#  2. This app uses Prisma + SQLite. The build generates the Prisma client;
+#     the runtime SQLite requirements are explained in DEPLOYMENT.md
+#     (verified: reads work from a read-only bundled database file).
+
+[build]
+  command = "npx prisma generate && npm run build"
+  publish = ".next"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"

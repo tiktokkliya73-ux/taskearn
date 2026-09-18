@@ -1,0 +1,335 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Users & Auth ────────────────────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String
+  email         String    @unique
+  passwordHash  String
+  role          String    @default("user") // 'user' | 'admin'
+  referralCode  String    @unique
+  referredById  String?
+  isBanned      Boolean   @default(false)
+  ipAddress     String? // captured at signup (anti self-referral check)
+  fingerprint   String? // captured at signup (anti self-referral check)
+  supabaseAuthId String? // links to the user's Supabase Auth account (auth.users.id)
+  recoveryEmail String? // optional secondary contact for account recovery (member-managed)
+  lastLoginAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  referredBy   User?         @relation("Referral", fields: [referredById], references: [id])
+  referrals    User[]        @relation("Referral")
+  wallet       Wallet?
+  userPlans    UserPlan[]
+  userPackages UserPackage[]
+  transactions Transaction[] @relation("TransactionUser")
+  relatedTxns  Transaction[] @relation("TransactionRelated")
+  userTasks    UserTask[]
+  packageTaskLogs PackageTaskLog[]
+  promoClaims  PromoClaim[]
+  resetTokens  PasswordResetToken[]
+  supportTickets SupportTicket[]
+}
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  token     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ─── Dual Wallet ─────────────────────────────────────────────────────────────
+
+model Wallet {
+  id                  String   @id @default(cuid())
+  userId              String   @unique
+  taskBalance         Int      @default(0) // daily task rewards — NOT withdrawable by default
+  withdrawableBalance Int      @default(0) // unlocked funds + referral bonuses — withdrawable
+  updatedAt           DateTime @updatedAt
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// ─── Plans & Tasks ───────────────────────────────────────────────────────────
+
+model Plan {
+  id             String     @id @default(cuid())
+  name           String
+  description    String?
+  price          Int // PKR
+  rewardPerTask  Int // PKR credited to task_balance per completed task
+  dailyTaskLimit Int // max tasks per day
+  durationDays   Int // plan validity
+  isActive       Boolean    @default(true)
+  sortOrder      Int        @default(0)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+  userPlans      UserPlan[]
+  tasks          Task[]
+}
+
+model Task {
+  id              String     @id @default(cuid())
+  title           String
+  description     String?
+  url             String // CPM / ad network page rendered in the execution modal
+  durationSeconds Int // countdown before the Claim button unlocks
+  rewardAmount    Int? // PKR override — null falls back to the plan's rewardPerTask
+  planId          String? // target investment plan — null = all plans
+  isActive        Boolean    @default(true)
+  sortOrder       Int        @default(0)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  plan            Plan?      @relation(fields: [planId], references: [id], onDelete: SetNull)
+  userTasks       UserTask[]
+}
+
+model UserPlan {
+  id        String   @id @default(cuid())
+  userId    String
+  planId    String
+  status    String   @default("active") // 'active' | 'expired'
+  startedAt DateTime @default(now())
+  expiresAt DateTime
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  plan      Plan     @relation(fields: [planId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+}
+
+model UserTask {
+  id           String    @id @default(cuid())
+  userId       String
+  taskId       String
+  date         String // YYYY-MM-DD (local server date)
+  startedAt    DateTime?
+  completedAt  DateTime?
+  rewardAmount Int? // reward actually paid on completion (task_logs record)
+  createdAt    DateTime  @default(now())
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task         Task      @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, taskId, date])
+}
+
+// ─── Daily Package Tasks (Ads → Daily Tasks flow) ────────────────────────────
+// The minimal task-completion record for the per-package daily task flow:
+// each ACTIVE UserPackage instance gets one daily task card on the Ads page.
+// startedAt registers the server-authoritative countdown start; completedAt +
+// rewardAmount record the paid claim. The same-day duplicate guard is the
+// unique (userId, userPackageId, date) key PLUS UserPackage.lastEarningDate
+// (also the nightly cron's idempotency marker — so a task claim and the cron
+// can never double-credit the same instance on the same day).
+
+model PackageTaskLog {
+  id            String    @id @default(cuid())
+  userId        String
+  userPackageId String
+  date          String // YYYY-MM-DD (local server date)
+  startedAt     DateTime
+  completedAt   DateTime?
+  rewardAmount  Int? // dailyEarning actually paid on completion
+  createdAt     DateTime  @default(now())
+  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userPackage   UserPackage  @relation(fields: [userPackageId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, userPackageId, date])
+  @@index([userId, date])
+}
+
+// ─── Investment Packages (dynamic engine) ───────────────────────────────────
+// Investment packages are 100% admin-managed and independent from the VIP
+// task Plans above: members buy them with their available balance (task +
+// withdrawable), can hold ANY number of them at once, and a nightly job
+// credits `dailyEarning` per active instance to the withdrawable balance.
+
+model InvestmentPackage {
+  id           String          @id @default(cuid())
+  title        String
+  description  String? // admin-editable marketing blurb shown in the checkout summary
+  price        Int // PKR investment amount
+  dailyEarning Int // PKR credited daily while active
+  durationDays Int // earning period in days
+  totalReturn  Int // dailyEarning * durationDays by default; admin can override
+  netProfit    Int // always derived: totalReturn - price
+  isActive     Boolean         @default(true)
+  sortOrder    Int             @default(0)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  userPackages UserPackage[]
+}
+
+model UserPackage {
+  id              String    @id @default(cuid())
+  userId          String
+  packageId       String
+  investAmount    Int // PKR deducted at purchase
+  dailyEarning    Int // snapshot of the package daily earning at purchase
+  status          String    @default("active") // 'active' | 'completed'
+  lastEarningDate String? // YYYY-MM-DD of the last credited day (cron idempotency)
+  startedAt       DateTime  @default(now())
+  endsAt          DateTime
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  user            User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  pkg             InvestmentPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  taskLogs        PackageTaskLog[]
+
+  @@index([userId, status])
+  @@index([status, endsAt])
+}
+
+// ─── Immutable Transaction Ledger ─────────────────────────────────────────────
+
+model Transaction {
+  id            String    @id @default(cuid())
+  userId        String
+  relatedUserId String? // invitee for referral_unlock, etc.
+  type          String // task_reward | referral_unlock | deposit | withdrawal | adjustment | plan_purchase
+  amount        Int // signed-ish: positive credit, negative debit (withdrawal stored as positive requested amount)
+  status        String // pending | completed | approved | rejected | blocked
+  description   String
+  meta          String? // JSON string: { paymentMethod, accountDetails, txId, planId, purpose, reason, inviteeId ... }
+  processedAt   DateTime?
+  createdAt     DateTime  @default(now())
+
+  user          User  @relation("TransactionUser", fields: [userId], references: [id], onDelete: Cascade)
+  relatedUser   User? @relation("TransactionRelated", fields: [relatedUserId], references: [id], onDelete: SetNull)
+
+  @@index([userId, type, status])
+  @@index([type, status])
+}
+
+// ─── System Settings (key-value) ─────────────────────────────────────────────
+
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Payment Methods (admin-managed checkout/deposit/withdraw channels) ──────
+// 100% dynamic: the admin adds/edits/orders/disables payment methods from
+// /admin/payment-methods and every member checkout (packages, VIP plans,
+// wallet deposit/withdraw) renders exactly these rows — never hardcoded.
+// Seeded once from the legacy system_settings gateway keys so the owner's
+// live merchant accounts carry over automatically.
+
+model PaymentMethod {
+  id            String   @id @default(cuid())
+  name          String   @unique // "EasyPaisa", "JazzCash", "USDT (TRC20)", custom…
+  accountNumber String // phone number / IBAN / wallet address
+  accountTitle  String? // merchant account title (copyable in checkout)
+  instructions  String? // per-method instructions shown under the account box
+  logoUrl       String? // optional logo / QR image URL (http/https)
+  sortOrder     Int      @default(0) // display order (lowest first)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
+// ─── Withdrawal Methods (admin-managed Withdraw-page payout channels) ───────
+// The payout channels members pick from the Withdraw page dropdown. Kept
+// SEPARATE from payment_methods (the deposit/checkout channels) so the two
+// systems stay independently configurable. `kind` drives the member payout
+// field: 'wallet' → Account / Mobile Number, 'bank' → Bank Account Number.
+// The channel set is fixed (seeded once with the seven payout channels);
+// the admin manages each channel's logo image, display order and enable
+// state from /admin/payment-methods.
+
+model WithdrawalMethod {
+  id        String   @id @default(cuid())
+  name      String   @unique // "EasyPaisa", "JazzCash", "UPaisa", "SadaPay", "NayaPay", "UBL Bank", "Bank Al Habib"
+  kind      String   @default("wallet") // 'wallet' | 'bank' — payout account field type
+  logoUrl   String? // optional logo image (http/https URL or uploaded image)
+  sortOrder Int      @default(0) // display order in the dropdown (lowest first)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── Promo Codes & Social Rewards (dynamic home widgets) ─────────────────────
+// Admin-managed reward codes members can redeem once each; the Telegram
+// join-reward is a special system row (code TELEGRAM) whose reward amount is
+// controlled by the home_telegram_reward setting at claim time.
+
+model PromoCode {
+  id           String       @id @default(cuid())
+  code         String       @unique // stored uppercase
+  title        String       @default("")
+  rewardAmount Int // PKR credited on claim
+  maxUses      Int? // null = unlimited
+  usedCount    Int          @default(0)
+  isActive     Boolean      @default(true)
+  isSystem     Boolean      @default(false) // TELEGRAM reward row
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  claims       PromoClaim[]
+}
+
+model PromoClaim {
+  id          String    @id @default(cuid())
+  promoCodeId String
+  userId      String
+  createdAt   DateTime  @default(now())
+  promoCode   PromoCode @relation(fields: [promoCodeId], references: [id], onDelete: Cascade)
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([promoCodeId, userId])
+}
+
+// ─── Admin Broadcast Notifications (member bell) ─────────────────────────────
+// Admin-authored announcements delivered to every member through the existing
+// dashboard notification bell. One row per broadcast — NO per-user read state,
+// so the table stays tiny no matter how many members the platform has.
+
+model Notification {
+  id        String   @id @default(cuid())
+  title     String
+  message   String
+  createdBy String // admin email who sent the broadcast
+  createdAt DateTime @default(now())
+}
+
+// ─── Member Support Tickets (member → admin help requests) ──────────────────
+// The simple in-app support channel: a member submits one subject + message,
+// the admin reads it from the Admin Panel, sets a status and optionally
+// replies once (the member sees the reply on the same ticket). Members only
+// ever see their OWN tickets — scoping is enforced server-side by userId on
+// every query (local Prisma) and by p_user_id in the SECURITY DEFINER RPCs
+// (Supabase) on top of the service-role-only RLS default-deny model.
+
+model SupportTicket {
+  id        String    @id @default(cuid())
+  userId    String
+  subject   String
+  message   String
+  status    String    @default("open") // 'open' | 'in_progress' | 'resolved' | 'closed'
+  reply     String? // admin's reply — shown to the member on the ticket
+  repliedAt DateTime?
+  // Per-message admin seen state (Support unread count): null = the member's
+  // message has NOT been seen by an admin yet (counts toward the sidebar
+  // badge); set the first time an admin opens the ticket (or replies to /
+  // updates it). Additive nullable column — existing rows simply start as
+  // "unseen", and member replies/tickets created later are unseen by default.
+  adminSeenAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([userId, createdAt])
+  @@index([adminSeenAt])
+}
